@@ -280,7 +280,6 @@ tiny-rodriguez-std/
 ├── Cargo.toml
 ├── LICENSE
 ├── README.md
-├── .github/workflows/ci.yml
 ├── src/
 │   ├── lib.rs        # point d'entrée et ré-exports
 │   ├── linalg.rs     # algèbre 3×3
