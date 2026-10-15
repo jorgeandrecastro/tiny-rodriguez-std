@@ -3,6 +3,14 @@ use bevy::prelude::*;
 use bevy_drone::to_bevy_quat;
 use tiny_rodriguez_std::{Pose3, Rotation3};
 
+#[derive(Resource, Default, PartialEq, Debug)]
+enum FlightMode {
+    #[default]
+    Stationary,
+    Looping { timer: f64 },
+    Patrol,
+}
+
 #[derive(Component)]
 struct Drone {
     pose: Pose3,
@@ -21,8 +29,9 @@ struct Hud;
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
+        .init_resource::<FlightMode>()
         .add_systems(Startup, setup)
-        .add_systems(Update, (fly, spin_propellers, follow_camera, hud).chain())
+        .add_systems(Update, (keyboard_input_system, fly, spin_propellers, follow_camera, hud).chain())
         .run();
 }
 
@@ -31,11 +40,11 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let body_mat = materials.add(Color::srgb_u8(40, 44, 52));
+    let body_mat = materials.add(Color::srgb_u8(35, 39, 46));
     let arm_mat = materials.add(Color::srgb_u8(70, 75, 85));
     let front_mat = materials.add(Color::srgb_u8(230, 50, 50));
     let rear_mat = materials.add(Color::srgb_u8(235, 235, 235));
-    let ground_mat = materials.add(Color::srgb_u8(60, 90, 60));
+    let ground_mat = materials.add(Color::srgb_u8(45, 70, 45));
 
     let body = meshes.add(Cuboid::new(0.3, 0.12, 0.42));
     let arm = meshes.add(Cuboid::new(1.6, 0.04, 0.06));
@@ -45,11 +54,11 @@ fn setup(
 
     // Sol
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(60.0, 60.0))),
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(80.0, 80.0))),
         MeshMaterial3d(ground_mat),
     ));
 
-    // Drone (le repère racine reçoit la pose SE(3))
+    // Drone racine
     commands
         .spawn((
             Transform::default(),
@@ -60,7 +69,6 @@ fn setup(
             },
         ))
         .with_children(|d| {
-            // Corps + "caméra" à l'avant
             d.spawn((Mesh3d(body), MeshMaterial3d(body_mat)));
             d.spawn((
                 Mesh3d(nose),
@@ -68,7 +76,6 @@ fn setup(
                 Transform::from_xyz(0.0, -0.02, -0.23),
             ));
 
-            // Deux bras en X
             for angle in [45.0_f32, -45.0] {
                 d.spawn((
                     Mesh3d(arm.clone()),
@@ -77,7 +84,6 @@ fn setup(
                 ));
             }
 
-            // Quatre moteurs + hélices (avant = -Z = rouge)
             let r = 0.566_f32;
             for (sx, sz) in [(1.0_f32, -1.0_f32), (-1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
                 let mat = if sz < 0.0 { front_mat.clone() } else { rear_mat.clone() };
@@ -86,14 +92,13 @@ fn setup(
                     MeshMaterial3d(body_mat_clone(&arm_mat)),
                     Transform::from_xyz(sx * r, 0.05, sz * r),
                 ));
-                // Hélices contrarotatives (sens alterné en damier)
                 let dir = (sx * sz) as f64;
                 d.spawn((
                     Transform::from_xyz(sx * r, 0.13, sz * r),
                     Visibility::default(),
                     Propeller {
                         orientation: Rotation3::identity(),
-                        omega: [0.0, dir * 60.0, 0.0],
+                        omega: [0.0, dir * 80.0, 0.0],
                     },
                 ))
                 .with_children(|p| {
@@ -107,20 +112,16 @@ fn setup(
             }
         });
 
-    // Lumières
+    // Éclairage
     commands.spawn((
-        DirectionalLight { illuminance: 12_000.0, ..default() },
-        Transform::from_xyz(5.0, 10.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
-    commands.spawn((
-        DirectionalLight { illuminance: 4_000.0, ..default() },
-        Transform::from_xyz(-5.0, 6.0, -5.0).looking_at(Vec3::ZERO, Vec3::Y),
+        DirectionalLight { illuminance: 15_000.0, ..default() },
+        Transform::from_xyz(10.0, 20.0, 10.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
     // Caméra
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(0.0, 4.0, 8.0).looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y),
+        Transform::from_xyz(0.0, 3.0, 7.0).looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y),
     ));
 
     // HUD
@@ -128,8 +129,8 @@ fn setup(
         Text::new(""),
         Node {
             position_type: PositionType::Absolute,
-            top: Val::Px(8.0),
-            left: Val::Px(8.0),
+            top: Val::Px(12.0),
+            left: Val::Px(12.0),
             ..default()
         },
         Hud,
@@ -140,18 +141,66 @@ fn body_mat_clone(h: &Handle<StandardMaterial>) -> Handle<StandardMaterial> {
     h.clone()
 }
 
-/// Vol : torseur constant dans le repère corps (avance + lacet) + oscillation verticale.
-/// T <- T · exp(ξ dt), exact pour ξ constant.
-fn fly(time: Res<Time>, mut query: Query<(&mut Transform, &mut Drone)>) {
+/// Gestion des entrées clavier pour changer de mode de vol
+fn keyboard_input_system(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut flight_mode: ResMut<FlightMode>,
+) {
+    if keyboard_input.just_pressed(KeyCode::KeyL) {
+        // Déclenche le looping (durée estimée à 3.0 secondes)
+        *flight_mode = FlightMode::Looping { timer: 0.0 };
+        println!("Commande clavier : Looping déclenché !");
+    }
+    if keyboard_input.just_pressed(KeyCode::KeyP) {
+        // Active le mode patrouille
+        *flight_mode = FlightMode::Patrol;
+        println!("Commande clavier : Mode Patrouille activé.");
+    }
+    if keyboard_input.just_pressed(KeyCode::KeyS) {
+        // Force le retour en stationnaire
+        *flight_mode = FlightMode::Stationary;
+        println!("Commande clavier : Mode Stationnaire.");
+    }
+}
+
+/// Mouvement du drone en fonction du mode actif
+fn fly(
+    time: Res<Time>,
+    mut flight_mode: ResMut<FlightMode>,
+    mut query: Query<(&mut Transform, &mut Drone)>,
+) {
     let dt = time.delta_secs_f64();
     let t = time.elapsed_secs_f64();
-    for (mut transform, mut drone) in &mut query {
-        // ξ = [vx, vy, vz, ωx, ωy, ωz]  (avance = -Z)
-        let twist = [0.0, 0.6 * (0.7 * t).cos(), -2.0, 0.0, 0.7, 0.0];
-        drone.pose = drone.pose.integrate(&twist, dt);
 
+    for (mut transform, mut drone) in &mut query {
+        let twist = match *flight_mode {
+            FlightMode::Stationary => {
+                // Légère oscillation naturelle de stationnaire pour faire vivre le drone
+                let hover_vz = 0.2 * (3.0 * t).sin();
+                [0.0, hover_vz, 0.0, 0.0, 0.0, 0.0]
+            }
+            FlightMode::Patrol => {
+                // Avance en tournant doucement sur lui-même
+                [-0.8, 0.0, -1.5, 0.0, 0.5, 0.0]
+            }
+            FlightMode::Looping { ref mut timer } => {
+                *timer += dt;
+                if *timer > 3.0 {
+                    // Fin du looping, retour automatique au stationnaire
+                    *flight_mode = FlightMode::Stationary;
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                } else {
+                    // Exécution de la rotation du looping (tangage + avance)
+                    [0.0, 0.5, -2.0, 0.0, 2.1, 0.0]
+                }
+            }
+        };
+
+        // Intégration exponentielle exacte via notre bibliothèque tiny-rodriguez-std
+        drone.pose = drone.pose.integrate(&twist, dt);
         drone.frames += 1;
-        if drone.frames % 600 == 0 {
+
+        if drone.frames % 500 == 0 {
             drone.pose.rotation = drone.pose.rotation.renormalized();
         }
 
@@ -176,21 +225,31 @@ fn follow_camera(
     let (Ok(d), Ok(mut cam)) = (drones.single(), cams.single_mut()) else {
         return;
     };
-    // Caméra derrière-dessus, lissée
-    let behind = d.translation + d.rotation * Vec3::new(0.0, 1.8, 5.0);
-    cam.translation = cam.translation.lerp(behind, 0.05);
-    cam.look_at(d.translation, Vec3::Y);
+    let target_cam_pos = d.translation + d.rotation * Vec3::new(0.0, 1.5, 4.5);
+    cam.translation = cam.translation.lerp(target_cam_pos, 0.08);
+    cam.look_at(d.translation + Vec3::Y * 0.5, Vec3::Y);
 }
 
-fn hud(drones: Query<&Drone>, mut texts: Query<&mut Text, With<Hud>>) {
+fn hud(
+    flight_mode: Res<FlightMode>,
+    drones: Query<&Drone>,
+    mut texts: Query<&mut Text, With<Hud>>,
+) {
     let (Ok(d), Ok(mut t)) = (drones.single(), texts.single_mut()) else {
         return;
     };
     let p = d.pose.translation;
+
+    let mode_str = match *flight_mode {
+        FlightMode::Stationary => "STATIONNAIRE (En attente...)",
+        FlightMode::Patrol => "PATROUILLE (Appuyez sur S pour stop)",
+        FlightMode::Looping { .. } => "ACROBATIE EN COURS (Looping 360)",
+    };
+
     t.0 = format!(
-        "|R^T R - I| = {:.2e}\npos = ({:.1}, {:.1}, {:.1})\nlacet = {:.2} rad",
+        "=== TINY-RODRIGUEZ SDK ===\nMode Actif : {}\n[L] Looping | [P] Patrouille | [S] Stationnaire\nErreur d'orthogonalite : {:.2e}\nPosition : ({:.1}, {:.1}, {:.1})",
+        mode_str,
         d.pose.rotation.orthogonality_error(),
-        p[0], p[1], p[2],
-        d.pose.rotation.angle()
+        p[0], p[1], p[2]
     );
 }
